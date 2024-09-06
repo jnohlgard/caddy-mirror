@@ -209,7 +209,7 @@ type responseWriterWrapper struct {
 
 func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
 	// ignore zero data writes
-	if rww.file.aborted || len(data) == 0 {
+	if rww.file.closed || len(data) == 0 {
 		return rww.ResponseWriter.Write(data)
 	}
 	var written = 0
