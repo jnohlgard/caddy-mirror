@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/google/renameio"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"io"
@@ -99,7 +100,7 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		logger.Debug("mirror file exists")
 	} else {
 		logger.Debug("creating temp file")
-		incomingFile, err := NewIncomingFile(filename)
+		incomingFile, err := createTempFile(filename)
 		if err != nil {
 			logger.Error("failed to create temp file", zap.Error(err))
 			if errors.Is(err, fs.ErrPermission) {
@@ -107,12 +108,11 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			}
 			return caddyhttp.Error(http.StatusInternalServerError, err)
 		}
-		defer func(f *IncomingFile) {
+		defer func(f *renameio.PendingFile) {
 			logger.Debug("closing temp file")
-			err := f.Close()
+			err := f.Cleanup()
 			if err != nil && !errors.Is(err, fs.ErrClosed) {
-				logger.Error("error when closing temp file",
-					zap.Object("file", loggableIncomingFile{f}),
+				logger.Error("error when cleaning up temp file",
 					zap.Error(err))
 			}
 		}(incomingFile)
@@ -125,16 +125,15 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 
 		if mir.EtagFileSuffix != "" {
 			etagFilename := filename + mir.EtagFileSuffix
-			etagFile, err := NewIncomingFile(etagFilename)
+			etagFile, err := createTempFile(etagFilename)
 			if err != nil {
 				logger.Error("failed to create Etag temp file", zap.Error(err))
 			} else if etagFile != nil {
-				defer func(f *IncomingFile) {
+				defer func(f *renameio.PendingFile) {
 					logger.Debug("closing Etag temp file")
-					err := f.Close()
+					err := f.Cleanup()
 					if err != nil && !errors.Is(err, fs.ErrClosed) {
-						logger.Error("error when closing Etag temp file",
-							zap.Object("etag_file", loggableIncomingFile{f}),
+						logger.Error("error when cleaning up Etag temp file",
 							zap.Error(err))
 					}
 				}(etagFile)
@@ -196,8 +195,8 @@ func (mir *Mirror) locateMirrorFile(root string, urlp string) string {
 
 type responseWriterWrapper struct {
 	*caddyhttp.ResponseWriterWrapper
-	file          *IncomingFile
-	etagFile      *IncomingFile
+	file          *renameio.PendingFile
+	etagFile      *renameio.PendingFile
 	config        *Mirror
 	logger        *zap.Logger
 	bytesExpected int64
@@ -211,7 +210,7 @@ type loggableMirrorWriter struct {
 
 func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
 	// ignore zero data writes
-	if rww.file.closed || len(data) == 0 {
+	if len(data) == 0 {
 		return rww.ResponseWriter.Write(data)
 	}
 	var written = 0
@@ -222,16 +221,14 @@ func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
 				zap.Int64("bytes_written", rww.bytesWritten),
 				zap.Int64("bytes_expected", rww.bytesExpected),
 			)
-			err := rww.file.Complete()
+			err := rww.file.CloseAtomicallyReplace()
 			if err != nil {
 				rww.logger.Error("failed to complete mirror file",
-					zap.Object("file", loggableIncomingFile{rww.file}),
 					zap.Error(err))
 			} else if rww.etagFile != nil {
-				err := rww.etagFile.Complete()
+				err := rww.etagFile.CloseAtomicallyReplace()
 				if err != nil {
 					rww.logger.Error("failed to complete etagFile",
-						zap.Object("file", loggableIncomingFile{rww.etagFile}),
 						zap.Error(err))
 				}
 			}
@@ -266,17 +263,15 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 				_, err := io.Copy(rww.etagFile, strings.NewReader(etag))
 				if err != nil {
 					rww.logger.Error("failed to write temp ETag file",
-						zap.Object("file", loggableIncomingFile{rww.etagFile}),
 						zap.Error(err))
 				}
 			}
 		}
 	} else {
 		// Avoid writing error messages and such to disk
-		err := rww.file.Abort()
+		err := rww.file.Cleanup()
 		if err != nil {
-			rww.logger.Error("failed to abort mirror file",
-				zap.Object("file", loggableIncomingFile{rww.file}),
+			rww.logger.Error("failed to clean up mirror file",
 				zap.Error(err))
 		}
 	}
@@ -287,76 +282,14 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 func (w loggableMirrorWriter) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 	enc.AddInt64("bytes_written", w.bytesWritten)
 	enc.AddInt64("bytes_expected", w.bytesExpected)
-	enc.AddObject("file", loggableIncomingFile{w.file})
-	if w.etagFile != nil {
-		enc.AddObject("etag_file", loggableIncomingFile{w.etagFile})
-	}
 	return nil
 }
 
-func (f *IncomingFile) Close() error {
-	if !f.completed {
-		return f.Abort()
-	}
-	return f.File.Close()
-}
-
-// Complete will close and rename the temporary file into its target name
-func (f *IncomingFile) Complete() error {
-	if f.aborted {
-		return &fs.PathError{
-			Op:   "IncomingFile.Complete()",
-			Path: f.Name(),
-			Err:  errors.New("file already aborted"),
-		}
-	}
-	if f.done {
-		return nil
-	}
-	if !f.closed {
-		// Important to fsync before renaming to avoid risking a 0 byte destination file
-		syncErr := f.Sync()
-		closeErr := f.File.Close()
-		f.closed = true
-		if (syncErr != nil) || (closeErr != nil) {
-			// If syncing and closing fails we will abort instead of complete this file.
-			abortErr := f.Abort()
-			return errors.Join(syncErr, closeErr, abortErr)
-		}
-	}
-	err := os.Rename(f.File.Name(), f.target)
-	if err != nil {
-		return err
-	}
-	f.completed = true
-	return nil
-}
-
-func (f *IncomingFile) Abort() error {
-	if f.completed {
-		return &fs.PathError{
-			Op:   "IncomingFile.Abort()",
-			Path: f.Name(),
-			Err:  errors.New("file already completed"),
-		}
-	}
-	if f.done {
-		return nil
-	}
-	f.aborted = true
-	// Defer error handling for Close until after we have attempted to remove the temp file
-	closeErr := f.File.Close()
-	f.closed = true
-	removeErr := os.Remove(f.File.Name())
-	f.done = true
-	return errors.Join(removeErr, closeErr)
-}
-
-func NewIncomingFile(path string) (*IncomingFile, error) {
-	dir, base := filepath.Split(path)
+func createTempFile(path string) (*renameio.PendingFile, error) {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, mkdirPerms); err != nil {
 		return nil, &fs.PathError{
-			Op:   "NewIncomingFile",
+			Op:   "createTempFile",
 			Path: path,
 			Err:  err,
 		}
@@ -365,30 +298,30 @@ func NewIncomingFile(path string) (*IncomingFile, error) {
 	if err == nil {
 		if stat.Mode().IsDir() {
 			return nil, &fs.PathError{
-				Op:   "NewIncomingFile",
+				Op:   "createTempFile",
 				Path: path,
 				Err:  ErrIsDir,
 			}
 		}
 		if !stat.Mode().IsRegular() {
 			return nil, &fs.PathError{
-				Op:   "NewIncomingFile",
+				Op:   "createTempFile",
 				Path: path,
 				Err:  ErrNotRegular,
 			}
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return nil, &fs.PathError{
-			Op:   "NewIncomingFile",
+			Op:   "createTempFile",
 			Path: path,
 			Err:  err,
 		}
 	}
 
-	temp, err := os.CreateTemp(dir, "._tmp_"+base)
+	temp, err := renameio.TempFile(dir, path)
 	if err != nil {
 		return nil, &fs.PathError{
-			Op:   "NewIncomingFile",
+			Op:   "createTempFile",
 			Path: path,
 			Err:  err,
 		}
@@ -396,9 +329,9 @@ func NewIncomingFile(path string) (*IncomingFile, error) {
 	if stat != nil {
 		ts, err := temp.Stat()
 		if err != nil {
-			closeErr := temp.Close()
+			closeErr := temp.Cleanup()
 			return nil, &fs.PathError{
-				Op:   "NewIncomingFile",
+				Op:   "createTempFile",
 				Path: path,
 				Err:  errors.Join(err, closeErr),
 			}
@@ -406,43 +339,16 @@ func NewIncomingFile(path string) (*IncomingFile, error) {
 		if ts.Mode().Perm() != stat.Mode().Perm() {
 			err := temp.Chmod(stat.Mode().Perm())
 			if err != nil {
-				closeErr := temp.Close()
+				closeErr := temp.Cleanup()
 				return nil, &fs.PathError{
-					Op:   "NewIncomingFile",
+					Op:   "createTempFile",
 					Path: path,
 					Err:  errors.Join(err, closeErr),
 				}
 			}
 		}
 	}
-	return &IncomingFile{
-		File:   temp,
-		target: path,
-	}, nil
-}
-
-type IncomingFile struct {
-	*os.File
-	target    string
-	completed bool
-	done      bool
-	closed    bool
-	aborted   bool
-}
-
-// loggableIncomingFile makes an IncomingFile loggable with zap.Object().
-type loggableIncomingFile struct {
-	*IncomingFile
-}
-
-func (f loggableIncomingFile) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	enc.AddString("target", f.target)
-	enc.AddString("temp_file", f.File.Name())
-	enc.AddBool("completed", f.completed)
-	enc.AddBool("done", f.done)
-	enc.AddBool("aborted", f.aborted)
-	enc.AddBool("closed", f.closed)
-	return nil
+	return temp, nil
 }
 
 const (
