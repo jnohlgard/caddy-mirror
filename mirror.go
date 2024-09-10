@@ -7,7 +7,6 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/google/renameio"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"io"
 	"io/fs"
 	"net/http"
@@ -203,11 +202,6 @@ type responseWriterWrapper struct {
 	bytesWritten  int64
 }
 
-// loggableMirrorWriter makes the response writer wrapper loggable with zap.Object().
-type loggableMirrorWriter struct {
-	*responseWriterWrapper
-}
-
 func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
 	// ignore zero data writes
 	if len(data) == 0 {
@@ -276,13 +270,6 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 		}
 	}
 	rww.ResponseWriter.WriteHeader(statusCode)
-}
-
-// MarshalLogObject satisfies the zapcore.ObjectMarshaler interface.
-func (w loggableMirrorWriter) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	enc.AddInt64("bytes_written", w.bytesWritten)
-	enc.AddInt64("bytes_expected", w.bytesExpected)
-	return nil
 }
 
 func createTempFile(path string) (*renameio.PendingFile, error) {
