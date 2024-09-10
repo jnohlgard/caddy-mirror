@@ -137,12 +137,42 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 					zap.Error(err))
 			}
 		}(incomingFile)
-
 		rww := &responseWriterWrapper{
 			ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: w},
 			file:                  incomingFile,
 			config:                mir,
 		}
+		if mir.EtagFileSuffix != "" {
+			etagFile, err := NewIncomingFile(filename + mir.EtagFileSuffix)
+			if err != nil {
+				mir.logger.Error("failed to create Etag temp file",
+					zap.String("site_root", root),
+					zap.String("request_path", urlp),
+					zap.String("filename", filename),
+					zap.Error(err))
+			}
+			if etagFile != nil {
+				defer func(etagFile *IncomingFile) {
+					mir.logger.Debug("closing Etag temp file",
+						zap.String("site_root", root),
+						zap.String("request_path", urlp),
+						zap.String("orig_file", filename),
+						zap.String("temp_file", etagFile.Name()),
+					)
+					err := etagFile.Close()
+					if err != nil {
+						mir.logger.Error("error when closing temp file",
+							zap.String("site_root", root),
+							zap.String("request_path", urlp),
+							zap.String("orig_file", filename),
+							zap.String("temp_file", etagFile.Name()),
+							zap.Error(err))
+					}
+				}(etagFile)
+				rww.etagFile = etagFile
+			}
+		}
+
 		w = rww
 		defer func(w *responseWriterWrapper) {
 			mir.logger.Debug("responseWriterWrapper leaving",
@@ -202,6 +232,7 @@ func (mir *Mirror) locateMirrorFile(root string, urlp string) string {
 type responseWriterWrapper struct {
 	*caddyhttp.ResponseWriterWrapper
 	file          *IncomingFile
+	etagFile      *IncomingFile
 	config        *Mirror
 	bytesExpected int64
 	bytesWritten  int64
@@ -223,6 +254,11 @@ func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
 			err := rww.file.Complete()
 			if err != nil {
 				rww.config.logger.Error("failed to complete responseWriterWrapper", zap.Error(err))
+			} else if rww.etagFile != nil {
+				err := rww.etagFile.Complete()
+				if err != nil {
+					rww.config.logger.Error("failed to complete etagFile", zap.Error(err))
+				}
 			}
 		}
 	}()
@@ -247,6 +283,17 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 		cl, err := strconv.ParseInt(rww.Header().Get("Content-Length"), 10, 64)
 		if err == nil {
 			rww.bytesExpected = cl
+		}
+		// Attempt to generate ETag sidecar file
+		if rww.etagFile != nil {
+			etag := rww.Header().Get("Etag")
+			if etag != "" {
+				_, err := io.Copy(rww.etagFile, strings.NewReader(etag))
+				if err != nil {
+					rww.config.logger.Error("failed to write temp ETag file",
+						zap.Error(err))
+				}
+			}
 		}
 	} else {
 		// Avoid writing error messages and such to disk
