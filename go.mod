@@ -4,6 +4,7 @@ go 1.23.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.8.4
+	github.com/google/renameio v0.1.0
 	go.uber.org/zap v1.27.0
 )
 
