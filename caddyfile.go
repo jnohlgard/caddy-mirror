@@ -1,10 +1,13 @@
 package mirror
 
 import (
+	"errors"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/pkg/xattr"
+	"strconv"
 )
 
 func init() {
@@ -43,6 +46,7 @@ func parseHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 //	mirror [<matcher>] [<root>] {
 //	    root              <path>
 //	    etag_file_suffix  <suffix>
+//	    xattr             [<bool>]
 //	}
 func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
@@ -64,6 +68,20 @@ func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !d.Args(&mir.EtagFileSuffix) {
 				return d.ArgErr()
 			}
+		case "xattr":
+			args := d.RemainingArgs()
+			switch len(args) {
+			case 0:
+				mir.UseXattr = true
+			case 1:
+				if val, err := strconv.ParseBool(args[0]); err == nil {
+					mir.UseXattr = val
+				} else {
+					return d.WrapErr(err)
+				}
+			default:
+				return d.ArgErr()
+			}
 		default:
 			return d.Errf("unknown subdirective '%s'", d.Val())
 		}
@@ -73,7 +91,9 @@ func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // Validate validates that the module has a usable config.
 func (mir Mirror) Validate() error {
-	// TODO: validate the module's setup
+	if mir.UseXattr && !xattr.XATTR_SUPPORTED {
+		return errors.New("missing platform xattr support")
+	}
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/google/renameio"
+	"github.com/pkg/xattr"
 	"go.uber.org/zap"
 	"io"
 	"io/fs"
@@ -37,6 +38,8 @@ type Mirror struct {
 	// If set, file Etags will be written to sidecar files
 	// with this suffix.
 	EtagFileSuffix string `json:"etag_file_suffix,omitempty"`
+
+	UseXattr bool `json:"xattr,omitempty"`
 
 	logger *zap.Logger
 }
@@ -233,10 +236,18 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 		if err == nil {
 			rww.bytesExpected = cl
 		}
-		// Attempt to generate ETag sidecar file
-		if rww.etagFile != nil {
-			etag := rww.Header().Get("Etag")
-			if etag != "" {
+		etag := rww.Header().Get("Etag")
+		if etag != "" {
+			// Store Etag as xattr
+			if rww.config.UseXattr {
+				err := xattr.FSet(rww.file.File, "user.xdg.origin.etag", []byte(etag))
+				if err != nil {
+					rww.logger.Error("failed to write ETag to xattr",
+						zap.Error(err))
+				}
+			}
+			// Store Etag as separate file
+			if rww.etagFile != nil {
 				_, err := io.Copy(rww.etagFile, strings.NewReader(etag))
 				if err != nil {
 					rww.logger.Error("failed to write temp ETag file",
