@@ -78,22 +78,24 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	// Replace any Caddy placeholders in Root
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	root := repl.ReplaceAll(mir.Root, ".")
-	filename := mir.locateMirrorFile(root, urlp)
 	logger := mir.logger.With(zap.String("site_root", root),
-		zap.String("request_path", urlp),
-		zap.String("filename", filename))
-	mirrorFileExists, err := mir.validateMirrorTarget(filename)
+		zap.String("request_path", urlp))
+	filename := mir.pathInsideRoot(root, urlp)
+	mirrorFileExists, err := regularFileExists(filename)
 	if err != nil {
 		if errors.Is(err, ErrIsDir) {
-			logger.Debug("skip directory")
+			logger.Debug("skip local directory")
 			return next.ServeHTTP(w, r)
-		} else if errors.Is(err, fs.ErrPermission) {
-			logger.Error("mirror file permission error, return 403",
+		} else if errors.Is(err, ErrNotRegular) {
+			logger.Error("local mirror is not a file!!",
 				zap.Error(err))
 			return caddyhttp.Error(http.StatusForbidden, err)
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return caddyhttp.Error(http.StatusInternalServerError, err)
+		} else if errors.Is(err, fs.ErrPermission) {
+			logger.Error("mirror file permission error",
+				zap.Error(err))
+			return caddyhttp.Error(http.StatusForbidden, err)
 		}
+		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 	if mirrorFileExists {
 		logger.Debug("mirror file exists")
@@ -101,20 +103,14 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 		logger.Debug("creating temp file")
 		incomingFile, err := createTempFile(filename)
 		if err != nil {
-			logger.Error("failed to create temp file", zap.Error(err))
+			logger.Error("failed to create temp file",
+				zap.Error(err))
 			if errors.Is(err, fs.ErrPermission) {
 				return caddyhttp.Error(http.StatusForbidden, err)
 			}
 			return caddyhttp.Error(http.StatusInternalServerError, err)
 		}
-		defer func(f *renameio.PendingFile) {
-			logger.Debug("closing temp file")
-			err := f.Cleanup()
-			if err != nil && !errors.Is(err, fs.ErrClosed) {
-				logger.Error("error when cleaning up temp file",
-					zap.Error(err))
-			}
-		}(incomingFile)
+		defer incomingFile.Cleanup()
 		rww := &responseWriterWrapper{
 			ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: w},
 			file:                  incomingFile,
@@ -126,16 +122,10 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			etagFilename := filename + mir.EtagFileSuffix
 			etagFile, err := createTempFile(etagFilename)
 			if err != nil {
-				logger.Error("failed to create Etag temp file", zap.Error(err))
-			} else if etagFile != nil {
-				defer func(f *renameio.PendingFile) {
-					logger.Debug("closing Etag temp file")
-					err := f.Cleanup()
-					if err != nil && !errors.Is(err, fs.ErrClosed) {
-						logger.Error("error when cleaning up Etag temp file",
-							zap.Error(err))
-					}
-				}(etagFile)
+				logger.Error("failed to create Etag temp file, continuing without writing Etag sidecar file",
+					zap.Error(err))
+			} else {
+				defer etagFile.Cleanup()
 				rww.etagFile = etagFile
 			}
 		}
@@ -148,8 +138,10 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 var ErrIsDir = errors.New("file is a directory")
 var ErrNotRegular = errors.New("file is not a regular file")
 
-// Returns true if the file exists and is a regular file, false otherwise
-func (mir *Mirror) validateMirrorTarget(filename string) (bool, error) {
+// regularFileExists checks if the given file exists and is a regular file
+// false is returned only if the file does not exist.
+// A fs.PathError is returned if filename exists and is not a regular file.
+func regularFileExists(filename string) (bool, error) {
 	stat, err := os.Lstat(filename)
 	if err != nil {
 		// fs.ErrNotExist is expected when we have not mirrored this path before
@@ -158,31 +150,22 @@ func (mir *Mirror) validateMirrorTarget(filename string) (bool, error) {
 		}
 		return false, err
 	} else if stat.Mode().IsDir() {
-		// Skip directories
-		return false, &fs.PathError{
-			Op:   "locate mirror copy",
+		return true, &fs.PathError{
+			Op:   "regularFileExists",
 			Path: filename,
 			Err:  ErrIsDir,
 		}
 	} else if !stat.Mode().IsRegular() {
-		mir.logger.Error("local mirror is not a file!!",
-			zap.String("filename", filename),
-			zap.String("fileinfo", fs.FormatFileInfo(stat)))
-
-		return false, caddyhttp.Error(http.StatusForbidden,
-			&fs.PathError{
-				Op:   "locate mirror copy",
-				Path: filename,
-				Err:  ErrNotRegular,
-			})
+		return true, &fs.PathError{
+			Op:   "regularFileExists",
+			Path: filename,
+			Err:  fmt.Errorf("%w: %v", ErrNotRegular, fs.FormatFileInfo(stat)),
+		}
 	}
-	mir.logger.Debug("mirror file info",
-		zap.String("filename", filename),
-		zap.String("fileinfo", fs.FormatFileInfo(stat)))
 	return true, nil
 }
 
-func (mir *Mirror) locateMirrorFile(root string, urlp string) string {
+func (mir *Mirror) pathInsideRoot(root string, urlp string) string {
 	// Figure out the local path of the given URL path
 	filename := strings.TrimSuffix(caddyhttp.SanitizedPathJoin(root, urlp), "/")
 	mir.logger.Debug("sanitized path join",
@@ -282,29 +265,22 @@ func createTempFile(path string) (*renameio.PendingFile, error) {
 		}
 	}
 	stat, err := os.Lstat(path)
-	if err == nil {
-		if stat.Mode().IsDir() {
-			return nil, &fs.PathError{
-				Op:   "createTempFile",
-				Path: path,
-				Err:  ErrIsDir,
-			}
-		}
-		if !stat.Mode().IsRegular() {
-			return nil, &fs.PathError{
-				Op:   "createTempFile",
-				Path: path,
-				Err:  ErrNotRegular,
-			}
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, &fs.PathError{
 			Op:   "createTempFile",
 			Path: path,
 			Err:  err,
 		}
 	}
+	if stat != nil && !stat.Mode().IsRegular() {
+		return nil, &fs.PathError{
+			Op:   "createTempFile",
+			Path: path,
+			Err:  ErrNotRegular,
+		}
+	}
 
+	// Create a temporary file in the same directory as the destination named ".<name><random numbers>"
 	temp, err := renameio.TempFile(dir, path)
 	if err != nil {
 		return nil, &fs.PathError{
@@ -314,6 +290,7 @@ func createTempFile(path string) (*renameio.PendingFile, error) {
 		}
 	}
 	if stat != nil {
+		// Attempt to chmod the temporary file to match the destination
 		ts, err := temp.Stat()
 		if err != nil {
 			closeErr := temp.Cleanup()
