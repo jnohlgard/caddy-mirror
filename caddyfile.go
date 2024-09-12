@@ -8,13 +8,28 @@ import (
 )
 
 func init() {
-	httpcaddyfile.RegisterHandlerDirective("mirror", parseCaddyfile)
+	httpcaddyfile.RegisterHandlerDirective("mirror", parseHandler)
+	httpcaddyfile.RegisterGlobalOption("mirror", parseOption)
 }
 
-// parseCaddyfile parses the mirror directive.
-// See UnmarshalCaddyfile for the syntax.
-func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+// parseOption parses the mirror global option block
+func parseOption(d *caddyfile.Dispenser, _ any) (any, error) {
 	mir := new(Mirror)
+	err := mir.UnmarshalCaddyfile(d)
+	if err != nil {
+		return mir, err
+	}
+	return mir, err
+}
+
+// parseHandler parses the mirror handler directive.
+// See UnmarshalCaddyfile for the syntax.
+func parseHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	mir := new(Mirror)
+	globalOptions := h.Option("mirror").(*Mirror)
+	if globalOptions != nil {
+		*mir = *globalOptions
+	}
 	err := mir.UnmarshalCaddyfile(h.Dispenser)
 	if err != nil {
 		return mir, err
