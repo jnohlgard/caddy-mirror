@@ -1,6 +1,8 @@
 package mirror
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/caddyserver/caddy/v2"
@@ -8,6 +10,7 @@ import (
 	"github.com/google/renameio/v2"
 	"github.com/pkg/xattr"
 	"go.uber.org/zap"
+	"hash"
 	"io"
 	"io/fs"
 	"net/http"
@@ -40,6 +43,8 @@ type Mirror struct {
 	EtagFileSuffix string `json:"etag_file_suffix,omitempty"`
 
 	UseXattr bool `json:"xattr,omitempty"`
+
+	Sha256Xattr bool `json:"sha256_xattr,omitempty"`
 
 	logger *zap.Logger
 }
@@ -186,6 +191,69 @@ type responseWriterWrapper struct {
 	logger        *zap.Logger
 	bytesExpected int64
 	bytesWritten  int64
+	contentHash   hash.Hash
+}
+
+func (rww *responseWriterWrapper) writeDone(written int64) {
+	rww.bytesWritten += written
+	if rww.bytesExpected > 0 && rww.bytesWritten == rww.bytesExpected {
+		rww.logger.Debug("responseWriterWrapper fully written",
+			zap.Int64("bytes_written", rww.bytesWritten),
+			zap.Int64("bytes_expected", rww.bytesExpected),
+		)
+		rww.finalize()
+	}
+}
+
+func (rww *responseWriterWrapper) finalize() {
+	if rww.contentHash != nil {
+		sum := rww.contentHash.Sum(nil)
+		sumText := hex.EncodeToString(sum)
+		rww.logger.Debug("hash done", zap.String("sum", sumText))
+		if rww.config.Sha256Xattr {
+			err := xattr.FSet(rww.file.File, "user.xdg.origin.sha256", []byte(sumText))
+			if err != nil {
+				rww.logger.Error("failed to set sha256 xattr",
+					zap.Binary("sha256", sum),
+					zap.Error(err))
+			}
+		}
+	}
+	err := rww.file.CloseAtomicallyReplace()
+	if err != nil {
+		rww.logger.Error("failed to complete mirror file",
+			zap.Error(err))
+		return
+	} else if rww.etagFile != nil {
+		err := rww.etagFile.CloseAtomicallyReplace()
+		if err != nil {
+			rww.logger.Error("failed to complete etagFile",
+				zap.Error(err))
+		}
+	}
+}
+
+// writeAll writes to w from data[], retrying until all of data[] has been consumed, unless an error other than ErrShortWrite occurs
+func writeAll(w io.Writer, data []byte) (int, error) {
+	written := 0
+	for {
+		// Keep going until we are not making any more progress
+		n, err := w.Write(data[written:])
+		written += n
+		if written > len(data) {
+			panic("wrote more than len(data)!!!")
+		}
+		if n == 0 {
+			if err == nil {
+				err = io.ErrShortWrite
+			}
+			return written, fmt.Errorf("not making progress: %w", err)
+		}
+		if written == len(data) {
+			break
+		}
+	}
+	return written, nil
 }
 
 func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
@@ -193,40 +261,22 @@ func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
 	if len(data) == 0 {
 		return rww.ResponseWriter.Write(data)
 	}
-	var written = 0
-	defer func() {
-		rww.bytesWritten += int64(written)
-		if rww.bytesExpected > 0 && rww.bytesWritten == rww.bytesExpected {
-			rww.logger.Debug("responseWriterWrapper fully written",
-				zap.Int64("bytes_written", rww.bytesWritten),
-				zap.Int64("bytes_expected", rww.bytesExpected),
-			)
-			err := rww.file.CloseAtomicallyReplace()
-			if err != nil {
-				rww.logger.Error("failed to complete mirror file",
-					zap.Error(err))
-			} else if rww.etagFile != nil {
-				err := rww.etagFile.CloseAtomicallyReplace()
-				if err != nil {
-					rww.logger.Error("failed to complete etagFile",
-						zap.Error(err))
-				}
-			}
-		}
-	}()
-	for {
-		// Write out the data buffer to the mirror file first
-		n, err := rww.file.Write(data[written:])
-		written += n
-		if err != nil && !errors.Is(err, io.ErrShortWrite) {
-			return written, err
-		}
-
-		if written == len(data) {
-			// Continue by passing the buffer on to the next ResponseWriter in the chain
-			return rww.ResponseWriter.Write(data)
+	if rww.contentHash != nil {
+		hashed, err := writeAll(rww.contentHash, data)
+		if err != nil {
+			rww.logger.Error("failed to hash data",
+				zap.Int("bytes_hashed", hashed),
+				zap.Error(err))
+			rww.contentHash = nil
 		}
 	}
+	written, err := writeAll(rww.file, data)
+	rww.writeDone(int64(written))
+	if err != nil {
+		return written, err
+	}
+	// Continue by passing the buffer on to the next ResponseWriter in the chain
+	return rww.ResponseWriter.Write(data)
 }
 
 func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
@@ -254,6 +304,9 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 						zap.Error(err))
 				}
 			}
+		}
+		if rww.config.Sha256Xattr {
+			rww.contentHash = sha256.New()
 		}
 	} else {
 		// Avoid writing error messages and such to disk

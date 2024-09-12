@@ -47,6 +47,7 @@ func parseHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 //	    root              <path>
 //	    etag_file_suffix  <suffix>
 //	    xattr             [<bool>]
+//	    sha256            xattr
 //	}
 func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
@@ -76,8 +77,22 @@ func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			case 1:
 				if val, err := strconv.ParseBool(args[0]); err == nil {
 					mir.UseXattr = val
+					mir.Sha256Xattr = mir.Sha256Xattr && val
 				} else {
 					return d.WrapErr(err)
+				}
+			default:
+				return d.ArgErr()
+			}
+		case "sha256":
+			args := d.RemainingArgs()
+			switch len(args) {
+			case 1:
+				if args[0] == "xattr" {
+					mir.UseXattr = true
+					mir.Sha256Xattr = true
+				} else {
+					return d.Err("sha256 only supports xattr at the moment")
 				}
 			default:
 				return d.ArgErr()
@@ -91,6 +106,9 @@ func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // Validate validates that the module has a usable config.
 func (mir Mirror) Validate() error {
+	if mir.Sha256Xattr && !mir.UseXattr {
+		return errors.New("sha256 xattr requires xattr enabled")
+	}
 	if mir.UseXattr && !xattr.XATTR_SUPPORTED {
 		return errors.New("missing platform xattr support")
 	}
