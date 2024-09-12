@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/google/renameio"
+	"github.com/google/renameio/v2"
 	"github.com/pkg/xattr"
 	"go.uber.org/zap"
 	"io"
