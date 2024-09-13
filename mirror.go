@@ -14,11 +14,15 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/textproto"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 func init() {
@@ -37,8 +41,8 @@ type Mirror struct {
 	// Responses from upstreams will be written to files within this root directory to be used as a local mirror of static content
 	Root string `json:"root,omitempty"`
 
-	// File name suffix to add to write Etags to.
-	// If set, file Etags will be written to sidecar files
+	// File name suffix to add to write ETags to.
+	// If set, file ETags will be written to sidecar files
 	// with this suffix.
 	EtagFileSuffix string `json:"etag_file_suffix,omitempty"`
 
@@ -89,8 +93,9 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	logger := mir.logger.With(zap.String("site_root", root),
 		zap.String("request_path", urlp))
 	filename := mir.pathInsideRoot(root, urlp)
-	mirrorFileExists, err := regularFileExists(filename)
-	if err != nil {
+	existingFile, err := openRegularFile(filename)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// ErrNotExist is expected if this path is not yet mirrored
 		if errors.Is(err, ErrIsDir) {
 			logger.Debug("skip local directory")
 			return next.ServeHTTP(w, r)
@@ -103,10 +108,78 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 				zap.Error(err))
 			return caddyhttp.Error(http.StatusForbidden, err)
 		}
-		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
-	if mirrorFileExists {
-		logger.Debug("mirror file exists")
+	if existingFile != nil {
+		defer existingFile.Close()
+		logger.Debug("mirror file opened for reading")
+		stat, _ := existingFile.Stat()
+		var modtime time.Time
+		if stat != nil {
+			modtime = stat.ModTime()
+		}
+
+		if w.Header().Get("ETag") == "" {
+			// Check if we have any ETag sources for this mirror file
+			var fileEtags []string
+			// Check if there are any xattrs set on the mirror file
+			if f, ok := existingFile.(*os.File); ok {
+				if mir.Sha256Xattr {
+					if etag := etagFromXattr(f, "user.xdg.origin.sha256"); etag != "" {
+						fileEtags = append(fileEtags, etag)
+					}
+				}
+				if mir.UseXattr {
+					if etag := etagFromXattr(f, "user.xdg.origin.etag"); etag != "" {
+						fileEtags = append(fileEtags, etag)
+					}
+				}
+			}
+			// Check if we have a sidecar file with an ETag
+			if mir.EtagFileSuffix != "" {
+				etag, err := etagFromFile(filename + mir.EtagFileSuffix)
+				if err != nil {
+					logger.Warn("etag from file failed", zap.Error(err))
+				} else if etag != "" {
+					fileEtags = append(fileEtags, etag)
+				}
+			}
+			logger.Debug("mirror file ETag candidates",
+				zap.Strings("file_etags", fileEtags))
+			if len(fileEtags) == 0 && stat != nil {
+				// Generate an ETag from the file size and modification time
+				etag := etagFromFileInfo(stat)
+				if etag != "" {
+					fileEtags = append(fileEtags, etag)
+				}
+			}
+			if len(fileEtags) == 1 {
+				w.Header().Set("ETag", fileEtags[0])
+			}
+			if len(fileEtags) > 1 {
+				// We need to figure out which of these ETags that our client might be asking for
+				for _, header := range []string{"If-None-Match", "If-Range", "If-Match"} {
+					etag := findEtagsInHeader(r, header, fileEtags)
+					if etag != "" {
+						w.Header().Set("ETag", etag)
+						break
+					}
+				}
+				if w.Header().Get("ETag") == "" {
+					// Nothing matched, pick the first from the above generated list.
+					w.Header().Set("ETag", fileEtags[0])
+				}
+			}
+			logger.Debug("content ETag",
+				zap.String("ETag", w.Header().Get("ETag")))
+		}
+		logger.Debug("serving content to client",
+			zap.Object("headers", caddyhttp.LoggableHTTPHeader{
+				Header: w.Header(),
+			}),
+		)
+		// Like the Caddy file_server implementation, we will let the standard library handle actually writing the right ranges to the client.
+		http.ServeContent(w, r, filename, modtime, existingFile.(io.ReadSeeker))
+		return nil
 	} else {
 		logger.Debug("creating temp file")
 		incomingFile, err := createTempFile(filename)
@@ -130,7 +203,7 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 			etagFilename := filename + mir.EtagFileSuffix
 			etagFile, err := createTempFile(etagFilename)
 			if err != nil {
-				logger.Error("failed to create Etag temp file, continuing without writing Etag sidecar file",
+				logger.Error("failed to create ETag temp file, continuing without writing ETag sidecar file",
 					zap.Error(err))
 			} else {
 				defer etagFile.Cleanup()
@@ -143,34 +216,143 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	return next.ServeHTTP(w, r)
 }
 
-var ErrIsDir = errors.New("file is a directory")
-var ErrNotRegular = errors.New("file is not a regular file")
-
-// regularFileExists checks if the given file exists and is a regular file
-// false is returned only if the file does not exist.
-// A fs.PathError is returned if filename exists and is not a regular file.
-func regularFileExists(filename string) (bool, error) {
-	stat, err := os.Lstat(filename)
-	if err != nil {
-		// fs.ErrNotExist is expected when we have not mirrored this path before
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
-	} else if stat.Mode().IsDir() {
-		return true, &fs.PathError{
-			Op:   "regularFileExists",
-			Path: filename,
-			Err:  ErrIsDir,
-		}
-	} else if !stat.Mode().IsRegular() {
-		return true, &fs.PathError{
-			Op:   "regularFileExists",
-			Path: filename,
-			Err:  fmt.Errorf("%w: %v", ErrNotRegular, fs.FormatFileInfo(stat)),
+// findEtagsInHeader looks for any of the given ETag values within the given header
+func findEtagsInHeader(r *http.Request, header string, etags []string) string {
+	for _, etag := range splitQuotedFields(r.Header.Get(header)) {
+		if etag != "" {
+			if slices.Contains(etags, etag) {
+				return etag
+			}
 		}
 	}
-	return true, nil
+	return ""
+}
+
+// splitQuotedFields splits an input string of comma-separated double-quoted values into separate strings for each value
+// The surrounding double quotes will be left intact in the resulting values.
+func splitQuotedFields(s string) (fields []string) {
+	fields = make([]string, 0)
+	quoted := false
+	start := 0
+	for end, val := range s {
+		if val == '"' {
+			quoted = !quoted
+		} else if val == ',' {
+			if !quoted && start < end {
+				fields = append(fields, textproto.TrimString(s[start:end]))
+				start = end + 1
+			}
+		}
+	}
+	if !quoted && start < len(s) {
+		fields = append(fields, textproto.TrimString(s[start:]))
+	}
+	return fields
+}
+
+// etagFromFileInfo calculates the ETag based on file size and modification time the same way as done by the Caddy
+// builtin file_server directive
+func etagFromFileInfo(stat fs.FileInfo) string {
+	mtime := stat.ModTime()
+	if mtimeUnix := mtime.Unix(); mtimeUnix == 0 || mtimeUnix == 1 {
+		return "" // not useful anyway; see issue #5548
+	}
+	var sb strings.Builder
+	sb.WriteRune('"')
+	sb.WriteString(strconv.FormatInt(mtime.UnixNano(), 36))
+	sb.WriteString(strconv.FormatInt(stat.Size(), 36))
+	sb.WriteRune('"')
+	return sb.String()
+}
+
+func etagFromFile(filename string) (string, error) {
+	f, openErr := openRegularFile(filename)
+	defer f.Close()
+	if openErr != nil {
+		return "", openErr
+	}
+	// DoS prevention: Avoid reading excessively large etag files
+	buf := make([]byte, 512)
+	n, readErr := f.Read(buf)
+	_ = f.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return "", readErr
+	}
+	if n >= len(buf) {
+		return "", fmt.Errorf("eTag sidecar file too big, read %v bytes", n)
+	}
+	return formatEtag(buf[:n]), nil
+}
+
+func etagFromXattr(file *os.File, name string) string {
+	buf, err := xattr.FGet(file, name)
+	if err == nil {
+		return formatEtag(buf)
+	}
+	return ""
+}
+
+// formatEtag filters the bytes in data into a properly formatted ETag entry, including adding surrounding double quotes if missing.
+// If data contains no usable characters, the empty string is returned (i.e. without any double quotes)
+func formatEtag(data []byte) (etag string) {
+	if len(data) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteRune('"')
+	n := 0
+	for _, val := range data {
+		// https://httpwg.org/specs/rfc9110.html#field.etag
+		if val < '\x21' || val == '\x22' || '\x7e' < val {
+			// Filter out all control chars, whitespace, double quotes, and anything beyond basic ASCII
+			continue
+		}
+		sb.WriteRune(rune(val))
+		n++
+	}
+	if n == 0 {
+		return ""
+	}
+	sb.WriteRune('"')
+	return sb.String()
+}
+
+var ErrNotRegular = errors.New("file is not a regular file")
+var ErrIsDir = errors.New("file is a directory")
+
+// openRegularFile opens a file and checks if the file is a regular file (no type bits are set)
+// ErrIsDir or ErrNotRegular is returned if filename exists and is not a regular file.
+func openRegularFile(filename string) (file fs.File, err error) {
+	// O_NOFOLLOW to avoid following symlinks in the final component of the file name
+	file, err = os.OpenFile(filename, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	keepOpen := false
+	defer func(file fs.File) {
+		if !keepOpen {
+			_ = file.Close()
+		}
+	}(file)
+	stat, err := file.Stat()
+	if err != nil {
+		return nil, err
+	} else if stat.Mode().IsDir() {
+		return nil, &fs.PathError{
+			Op:   "openRegularFile",
+			Path: filename,
+			Err:  fmt.Errorf("%w: %w (%v)", ErrNotRegular, ErrIsDir, fs.FormatFileInfo(stat)),
+		}
+	} else if !stat.Mode().IsRegular() {
+		return nil, &fs.PathError{
+			Op:   "openRegularFile",
+			Path: filename,
+			Err:  fmt.Errorf("%w (%v)", ErrNotRegular, fs.FormatFileInfo(stat)),
+		}
+	} else {
+		keepOpen = true
+	}
+	return file, nil
 }
 
 func (mir *Mirror) pathInsideRoot(root string, urlp string) string {
@@ -286,9 +468,9 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 		if err == nil {
 			rww.bytesExpected = cl
 		}
-		etag := rww.Header().Get("Etag")
+		etag := rww.Header().Get("ETag")
 		if etag != "" {
-			// Store Etag as xattr
+			// Store ETag as xattr
 			if rww.config.UseXattr {
 				err := xattr.FSet(rww.file.File, "user.xdg.origin.etag", []byte(etag))
 				if err != nil {
@@ -296,7 +478,7 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 						zap.Error(err))
 				}
 			}
-			// Store Etag as separate file
+			// Store ETag as separate file
 			if rww.etagFile != nil {
 				_, err := io.Copy(rww.etagFile, strings.NewReader(etag))
 				if err != nil {
