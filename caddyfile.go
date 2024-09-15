@@ -13,6 +13,7 @@ import (
 func init() {
 	httpcaddyfile.RegisterHandlerDirective("mirror", parseHandler)
 	httpcaddyfile.RegisterGlobalOption("mirror", parseOption)
+	httpcaddyfile.RegisterDirectiveOrder("mirror", httpcaddyfile.Before, "reverse_proxy")
 }
 
 // parseOption parses the mirror global option block
