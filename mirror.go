@@ -14,15 +14,11 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
-	"net/textproto"
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 )
 
 func init() {
@@ -71,7 +67,7 @@ func (mir *Mirror) Provision(ctx caddy.Context) error {
 
 func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if r.Method != http.MethodGet {
-		mir.logger.Debug("Ignore non-GET request",
+		mir.logger.Debug("Pass through non-GET request",
 			zap.String("method", r.Method),
 			zap.String("path", r.URL.Path))
 		return next.ServeHTTP(w, r)
@@ -92,276 +88,46 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	root := repl.ReplaceAll(mir.Root, ".")
 	logger := mir.logger.With(zap.String("site_root", root),
 		zap.String("request_path", urlp))
-	filename := mir.pathInsideRoot(root, urlp)
-	existingFile, err := openRegularFile(filename)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		// ErrNotExist is expected if this path is not yet mirrored
-		if errors.Is(err, ErrIsDir) {
-			logger.Debug("skip local directory")
-			return next.ServeHTTP(w, r)
-		} else if errors.Is(err, ErrNotRegular) {
-			logger.Error("local mirror is not a file!!",
-				zap.Error(err))
-			return caddyhttp.Error(http.StatusForbidden, err)
-		} else if errors.Is(err, fs.ErrPermission) {
-			logger.Error("mirror file permission error",
-				zap.Error(err))
+	filename := pathInsideRoot(root, urlp)
+	logger.Debug("creating temp file")
+	incomingFile, err := createTempFile(filename)
+	if err != nil {
+		logger.Error("failed to create temp file",
+			zap.Error(err))
+		if errors.Is(err, fs.ErrPermission) {
 			return caddyhttp.Error(http.StatusForbidden, err)
 		}
+		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
-	if existingFile != nil {
-		defer existingFile.Close()
-		logger.Debug("mirror file opened for reading")
-		stat, _ := existingFile.Stat()
-		var modtime time.Time
-		if stat != nil {
-			modtime = stat.ModTime()
-		}
+	defer incomingFile.Cleanup()
+	rww := &responseWriterWrapper{
+		ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: w},
+		file:                  incomingFile,
+		config:                mir,
+		logger:                logger.With(zap.Namespace("rww")),
+	}
 
-		if w.Header().Get("ETag") == "" {
-			// Check if we have any ETag sources for this mirror file
-			var fileEtags []string
-			// Check if there are any xattrs set on the mirror file
-			if f, ok := existingFile.(*os.File); ok {
-				if mir.Sha256Xattr {
-					if etag := etagFromXattr(f, "user.xdg.origin.sha256"); etag != "" {
-						fileEtags = append(fileEtags, etag)
-					}
-				}
-				if mir.UseXattr {
-					if etag := etagFromXattr(f, "user.xdg.origin.etag"); etag != "" {
-						fileEtags = append(fileEtags, etag)
-					}
-				}
-			}
-			// Check if we have a sidecar file with an ETag
-			if mir.EtagFileSuffix != "" {
-				etag, err := etagFromFile(filename + mir.EtagFileSuffix)
-				if err != nil {
-					logger.Warn("etag from file failed", zap.Error(err))
-				} else if etag != "" {
-					fileEtags = append(fileEtags, etag)
-				}
-			}
-			logger.Debug("mirror file ETag candidates",
-				zap.Strings("file_etags", fileEtags))
-			if len(fileEtags) == 0 && stat != nil {
-				// Generate an ETag from the file size and modification time
-				etag := etagFromFileInfo(stat)
-				if etag != "" {
-					fileEtags = append(fileEtags, etag)
-				}
-			}
-			if len(fileEtags) == 1 {
-				w.Header().Set("ETag", fileEtags[0])
-			}
-			if len(fileEtags) > 1 {
-				// We need to figure out which of these ETags that our client might be asking for
-				for _, header := range []string{"If-None-Match", "If-Range", "If-Match"} {
-					etag := findEtagsInHeader(r, header, fileEtags)
-					if etag != "" {
-						w.Header().Set("ETag", etag)
-						break
-					}
-				}
-				if w.Header().Get("ETag") == "" {
-					// Nothing matched, pick the first from the above generated list.
-					w.Header().Set("ETag", fileEtags[0])
-				}
-			}
-			logger.Debug("content ETag",
-				zap.String("ETag", w.Header().Get("ETag")))
-		}
-		logger.Debug("serving content to client",
-			zap.Object("headers", caddyhttp.LoggableHTTPHeader{
-				Header: w.Header(),
-			}),
-		)
-		// Like the Caddy file_server implementation, we will let the standard library handle actually writing the right ranges to the client.
-		http.ServeContent(w, r, filename, modtime, existingFile.(io.ReadSeeker))
-		return nil
-	} else {
-		logger.Debug("creating temp file")
-		incomingFile, err := createTempFile(filename)
+	if mir.EtagFileSuffix != "" {
+		etagFilename := filename + mir.EtagFileSuffix
+		etagFile, err := createTempFile(etagFilename)
 		if err != nil {
-			logger.Error("failed to create temp file",
+			logger.Error("failed to create ETag temp file, continuing without writing ETag sidecar file",
 				zap.Error(err))
-			if errors.Is(err, fs.ErrPermission) {
-				return caddyhttp.Error(http.StatusForbidden, err)
-			}
-			return caddyhttp.Error(http.StatusInternalServerError, err)
+		} else {
+			defer etagFile.Cleanup()
+			rww.etagFile = etagFile
 		}
-		defer incomingFile.Cleanup()
-		rww := &responseWriterWrapper{
-			ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: w},
-			file:                  incomingFile,
-			config:                mir,
-			logger:                logger.With(zap.Namespace("rww")),
-		}
-
-		if mir.EtagFileSuffix != "" {
-			etagFilename := filename + mir.EtagFileSuffix
-			etagFile, err := createTempFile(etagFilename)
-			if err != nil {
-				logger.Error("failed to create ETag temp file, continuing without writing ETag sidecar file",
-					zap.Error(err))
-			} else {
-				defer etagFile.Cleanup()
-				rww.etagFile = etagFile
-			}
-		}
-		w = rww
 	}
+	w = rww
 
 	return next.ServeHTTP(w, r)
 }
 
-// findEtagsInHeader looks for any of the given ETag values within the given header
-func findEtagsInHeader(r *http.Request, header string, etags []string) string {
-	for _, etag := range splitQuotedFields(r.Header.Get(header)) {
-		if etag != "" {
-			if slices.Contains(etags, etag) {
-				return etag
-			}
-		}
-	}
-	return ""
-}
-
-// splitQuotedFields splits an input string of comma-separated double-quoted values into separate strings for each value
-// The surrounding double quotes will be left intact in the resulting values.
-func splitQuotedFields(s string) (fields []string) {
-	fields = make([]string, 0)
-	quoted := false
-	start := 0
-	for end, val := range s {
-		if val == '"' {
-			quoted = !quoted
-		} else if val == ',' {
-			if !quoted && start < end {
-				fields = append(fields, textproto.TrimString(s[start:end]))
-				start = end + 1
-			}
-		}
-	}
-	if !quoted && start < len(s) {
-		fields = append(fields, textproto.TrimString(s[start:]))
-	}
-	return fields
-}
-
-// etagFromFileInfo calculates the ETag based on file size and modification time the same way as done by the Caddy
-// builtin file_server directive
-func etagFromFileInfo(stat fs.FileInfo) string {
-	mtime := stat.ModTime()
-	if mtimeUnix := mtime.Unix(); mtimeUnix == 0 || mtimeUnix == 1 {
-		return "" // not useful anyway; see issue #5548
-	}
-	var sb strings.Builder
-	sb.WriteRune('"')
-	sb.WriteString(strconv.FormatInt(mtime.UnixNano(), 36))
-	sb.WriteString(strconv.FormatInt(stat.Size(), 36))
-	sb.WriteRune('"')
-	return sb.String()
-}
-
-func etagFromFile(filename string) (string, error) {
-	f, openErr := openRegularFile(filename)
-	defer f.Close()
-	if openErr != nil {
-		return "", openErr
-	}
-	// DoS prevention: Avoid reading excessively large etag files
-	buf := make([]byte, 512)
-	n, readErr := f.Read(buf)
-	_ = f.Close()
-	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		return "", readErr
-	}
-	if n >= len(buf) {
-		return "", fmt.Errorf("eTag sidecar file too big, read %v bytes", n)
-	}
-	return formatEtag(buf[:n]), nil
-}
-
-func etagFromXattr(file *os.File, name string) string {
-	buf, err := xattr.FGet(file, name)
-	if err == nil {
-		return formatEtag(buf)
-	}
-	return ""
-}
-
-// formatEtag filters the bytes in data into a properly formatted ETag entry, including adding surrounding double quotes if missing.
-// If data contains no usable characters, the empty string is returned (i.e. without any double quotes)
-func formatEtag(data []byte) (etag string) {
-	if len(data) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteRune('"')
-	n := 0
-	for _, val := range data {
-		// https://httpwg.org/specs/rfc9110.html#field.etag
-		if val < '\x21' || val == '\x22' || '\x7e' < val {
-			// Filter out all control chars, whitespace, double quotes, and anything beyond basic ASCII
-			continue
-		}
-		sb.WriteRune(rune(val))
-		n++
-	}
-	if n == 0 {
-		return ""
-	}
-	sb.WriteRune('"')
-	return sb.String()
-}
-
 var ErrNotRegular = errors.New("file is not a regular file")
-var ErrIsDir = errors.New("file is a directory")
 
-// openRegularFile opens a file and checks if the file is a regular file (no type bits are set)
-// ErrIsDir or ErrNotRegular is returned if filename exists and is not a regular file.
-func openRegularFile(filename string) (file fs.File, err error) {
-	// O_NOFOLLOW to avoid following symlinks in the final component of the file name
-	file, err = os.OpenFile(filename, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, err
-	}
-	keepOpen := false
-	defer func(file fs.File) {
-		if !keepOpen {
-			_ = file.Close()
-		}
-	}(file)
-	stat, err := file.Stat()
-	if err != nil {
-		return nil, err
-	} else if stat.Mode().IsDir() {
-		return nil, &fs.PathError{
-			Op:   "openRegularFile",
-			Path: filename,
-			Err:  fmt.Errorf("%w: %w (%v)", ErrNotRegular, ErrIsDir, fs.FormatFileInfo(stat)),
-		}
-	} else if !stat.Mode().IsRegular() {
-		return nil, &fs.PathError{
-			Op:   "openRegularFile",
-			Path: filename,
-			Err:  fmt.Errorf("%w (%v)", ErrNotRegular, fs.FormatFileInfo(stat)),
-		}
-	} else {
-		keepOpen = true
-	}
-	return file, nil
-}
-
-func (mir *Mirror) pathInsideRoot(root string, urlp string) string {
+func pathInsideRoot(root string, urlp string) string {
 	// Figure out the local path of the given URL path
 	filename := strings.TrimSuffix(caddyhttp.SanitizedPathJoin(root, urlp), "/")
-	mir.logger.Debug("sanitized path join",
-		zap.String("site_root", root),
-		zap.String("request_path", urlp),
-		zap.String("result", filename))
 	return filename
 }
 
