@@ -52,12 +52,7 @@ func parseHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 //	}
 func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
-	args := d.RemainingArgs()
-	switch len(args) {
-	case 0:
-	case 1:
-		mir.Root = args[0]
-	default:
+	if d.CountRemainingArgs() > 0 {
 		return d.ArgErr()
 	}
 	for d.NextBlock(0) {
