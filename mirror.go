@@ -205,29 +205,28 @@ func writeAll(w io.Writer, data []byte) (int, error) {
 }
 
 func (rww *responseWriterWrapper) Write(data []byte) (int, error) {
-	// ignore zero data writes
-	if len(data) == 0 {
-		return rww.ResponseWriter.Write(data)
-	}
-	if rww.contentHash != nil {
-		hashed, err := writeAll(rww.contentHash, data)
-		if err != nil {
-			rww.logger.Error("failed to hash data",
-				zap.Int("bytes_hashed", hashed),
-				zap.Error(err))
-			rww.contentHash = nil
+	if len(data) > 0 && rww.file != nil {
+		if rww.contentHash != nil {
+			hashed, err := writeAll(rww.contentHash, data)
+			if err != nil {
+				rww.logger.Error("failed to hash data",
+					zap.Int("bytes_hashed", hashed),
+					zap.Error(err))
+				rww.contentHash = nil
+			}
 		}
-	}
-	written, err := writeAll(rww.file, data)
-	rww.writeDone(int64(written))
-	if err != nil {
-		return written, err
+		written, err := writeAll(rww.file, data)
+		rww.writeDone(int64(written))
+		if err != nil {
+			return written, err
+		}
 	}
 	// Continue by passing the buffer on to the next ResponseWriter in the chain
 	return rww.ResponseWriter.Write(data)
 }
 
 func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
+	rww.logger.Debug("WriteHeader", zap.Int("status_code", statusCode))
 	if statusCode == http.StatusOK {
 		// Get the Content-Length header to figure out how much data to expect
 		cl, err := strconv.ParseInt(rww.Header().Get("Content-Length"), 10, 64)
@@ -256,9 +255,10 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 		if rww.config.Sha256Xattr {
 			rww.contentHash = sha256.New()
 		}
-	} else {
+	} else if rww.file != nil {
 		// Avoid writing error messages and such to disk
 		err := rww.file.Cleanup()
+		rww.file = nil
 		if err != nil {
 			rww.logger.Error("failed to clean up mirror file",
 				zap.Error(err))
