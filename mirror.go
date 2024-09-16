@@ -89,42 +89,16 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	root := repl.ReplaceAll(mir.Root, ".")
 	logger := mir.logger.With(zap.String("site_root", root),
 		zap.String("request_path", urlp))
-	filename := pathInsideRoot(root, urlp)
-	if mir.HideTempFiles {
-		if strings.HasPrefix(path.Base(filename), ".") {
-			logger.Debug("hide temp file", zap.String("filename", filename))
-			return caddyhttp.Error(http.StatusNotFound, errors.New("not found"))
-		}
-	}
-	logger.Debug("creating temp file")
-	incomingFile, err := createTempFile(filename)
-	if err != nil {
-		logger.Error("failed to create temp file",
-			zap.Error(err))
-		if errors.Is(err, fs.ErrPermission) {
-			return caddyhttp.Error(http.StatusForbidden, err)
-		}
-		return caddyhttp.Error(http.StatusInternalServerError, err)
-	}
-	defer incomingFile.Cleanup()
+
 	rww := &responseWriterWrapper{
 		ResponseWriterWrapper: &caddyhttp.ResponseWriterWrapper{ResponseWriter: w},
-		file:                  incomingFile,
 		config:                mir,
+		root:                  root,
+		path:                  urlp,
 		logger:                logger.With(zap.Namespace("rww")),
 	}
+	defer rww.Cleanup()
 
-	if mir.EtagFileSuffix != "" {
-		etagFilename := filename + mir.EtagFileSuffix
-		etagFile, err := createTempFile(etagFilename)
-		if err != nil {
-			logger.Error("failed to create ETag temp file, continuing without writing ETag sidecar file",
-				zap.Error(err))
-		} else {
-			defer etagFile.Cleanup()
-			rww.etagFile = etagFile
-		}
-	}
 	w = rww
 
 	return next.ServeHTTP(w, r)
@@ -143,10 +117,27 @@ type responseWriterWrapper struct {
 	file          *renameio.PendingFile
 	etagFile      *renameio.PendingFile
 	config        *Mirror
+	root          string
+	path          string
 	logger        *zap.Logger
 	bytesExpected int64
 	bytesWritten  int64
 	contentHash   hash.Hash
+}
+
+func (rww *responseWriterWrapper) Cleanup() error {
+	var fileErr error
+	var etagErr error
+
+	if rww.file != nil {
+		fileErr = rww.file.Cleanup()
+		rww.file = nil
+	}
+	if rww.etagFile != nil {
+		etagErr = rww.etagFile.Cleanup()
+		rww.etagFile = nil
+	}
+	return errors.Join(fileErr, etagErr)
 }
 
 func (rww *responseWriterWrapper) writeDone(written int64) {
@@ -241,6 +232,21 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 			rww.bytesExpected = cl
 		}
 		etag := rww.Header().Get("ETag")
+		filename := pathInsideRoot(rww.root, rww.path)
+		if rww.file == nil {
+			rww.logger.Debug("creating temp file")
+			rww.file, err = createTempFile(filename)
+			if err != nil {
+				rww.logger.Error("failed to create mirror temp file",
+					zap.Error(err))
+				if errors.Is(err, fs.ErrPermission) {
+					statusCode = http.StatusForbidden
+				} else {
+					statusCode = http.StatusInternalServerError
+				}
+				rww.file = nil
+			}
+		}
 		if etag != "" {
 			// Store ETag as xattr
 			if rww.config.UseXattr {
@@ -251,24 +257,24 @@ func (rww *responseWriterWrapper) WriteHeader(statusCode int) {
 				}
 			}
 			// Store ETag as separate file
-			if rww.etagFile != nil {
-				_, err := io.Copy(rww.etagFile, strings.NewReader(etag))
+			if rww.config.EtagFileSuffix != "" {
+				etagFilename := filename + rww.config.EtagFileSuffix
+				etagFile, err := createTempFile(etagFilename)
 				if err != nil {
-					rww.logger.Error("failed to write temp ETag file",
+					rww.logger.Error("failed to create ETag temp file, continuing without writing ETag sidecar file",
 						zap.Error(err))
+				} else {
+					rww.etagFile = etagFile
+					_, err := io.Copy(rww.etagFile, strings.NewReader(etag))
+					if err != nil {
+						rww.logger.Error("failed to write temp ETag file",
+							zap.Error(err))
+					}
 				}
 			}
 		}
 		if rww.config.Sha256Xattr {
 			rww.contentHash = sha256.New()
-		}
-	} else if rww.file != nil {
-		// Avoid writing error messages and such to disk
-		err := rww.file.Cleanup()
-		rww.file = nil
-		if err != nil {
-			rww.logger.Error("failed to clean up mirror file",
-				zap.Error(err))
 		}
 	}
 	rww.ResponseWriter.WriteHeader(statusCode)
