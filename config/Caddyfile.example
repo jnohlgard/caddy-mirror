@@ -1,0 +1,76 @@
+{
+	mirror {
+		etag_file_suffix .etag
+		xattr
+		sha256 xattr
+	}
+}
+
+&(mirror_upstream) {
+	handle {
+		mirror
+		reverse_proxy https://mirror.example.com:443 {
+			header_up Host {upstream_hostport}
+			header_up -X-Forwarded-*
+			transport http {
+				dial_timeout 1s
+				tls_timeout 2s
+				response_header_timeout 2s
+				read_timeout 10s
+			}
+		}
+	}
+}
+
+&(local_files) {
+	@hidden_files path .* *.etag
+	handle @hidden_files {
+		# fail immediately and don't look upstream for these files
+		error 404
+	}
+	handle {
+		file_server {
+			# reset status to override 5xx status from problems reaching the upstream mirror
+			status 0
+			etag_file_extensions .etag
+			pass_thru
+		}
+	}
+}
+
+&(upstream_unreachable) {
+	invoke local_files
+}
+
+localhost {
+	root * /srv/mirror
+	@read method GET HEAD OPTIONS
+	# These are files and paths that are dynamically updated in apt (deb) repos, always check upstream first if there is a newer version available
+	@debrepos path */current/* InRelease Release Release.gpg Packages.* Sources.* Contents-* Translation-* Commands-* Index
+	# These are file names that are dynamically updated in yum (RPM) repos
+	@yumrepos path repomd.xml state COMPOSE_ID
+	@file file
+	handle @read {
+		route @yumrepos {
+			invoke mirror_upstream
+		}
+		route @debrepos {
+			invoke mirror_upstream
+		}
+		route {
+			invoke local_files
+			invoke mirror_upstream
+		}
+	}
+	handle {
+		# Disallow POST, PUT, DELETE etc.
+		error 405
+	}
+	handle_errors 5xx {
+		# Fall back to serving any locally mirrored file if the upstream request failed
+		invoke upstream_unreachable
+	}
+	handle_errors {
+		respond "{err.status_code} {err.status_text}"
+	}
+}
