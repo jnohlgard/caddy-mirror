@@ -1,6 +1,8 @@
 module github.com/jnohlgard/caddy-mirror
 
-go 1.23.0
+go 1.22.3
+
+toolchain go1.23.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.8.4
