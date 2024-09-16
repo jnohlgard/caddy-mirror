@@ -300,35 +300,15 @@ func createTempFile(path string) (*renameio.PendingFile, error) {
 	}
 
 	// Create a temporary file in the same directory as the destination named ".<name><random numbers>"
-	temp, err := renameio.TempFile(dir, path)
+	temp, err := renameio.NewPendingFile(path,
+		renameio.WithTempDir(dir),
+		renameio.WithPermissions(filePerms),
+		renameio.WithExistingPermissions())
 	if err != nil {
 		return nil, &fs.PathError{
 			Op:   "createTempFile",
 			Path: path,
 			Err:  err,
-		}
-	}
-	if stat != nil {
-		// Attempt to chmod the temporary file to match the destination
-		ts, err := temp.Stat()
-		if err != nil {
-			closeErr := temp.Cleanup()
-			return nil, &fs.PathError{
-				Op:   "createTempFile",
-				Path: path,
-				Err:  errors.Join(err, closeErr),
-			}
-		}
-		if ts.Mode().Perm() != stat.Mode().Perm() {
-			err := temp.Chmod(stat.Mode().Perm())
-			if err != nil {
-				closeErr := temp.Cleanup()
-				return nil, &fs.PathError{
-					Op:   "createTempFile",
-					Path: path,
-					Err:  errors.Join(err, closeErr),
-				}
-			}
 		}
 	}
 	return temp, nil
@@ -337,6 +317,7 @@ func createTempFile(path string) (*renameio.PendingFile, error) {
 const (
 	// mode before umask is applied
 	mkdirPerms fs.FileMode = 0o777
+	filePerms  fs.FileMode = 0o666
 )
 
 // Interface guards
