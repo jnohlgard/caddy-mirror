@@ -44,7 +44,8 @@ type Mirror struct {
 
 	UseXattr bool `json:"xattr,omitempty"`
 
-	Sha256Xattr bool `json:"sha256_xattr,omitempty"`
+	Sha256Xattr   bool `json:"sha256_xattr,omitempty"`
+	HideTempFiles bool `json:"hide_temp_files,omitempty"`
 
 	logger *zap.Logger
 }
@@ -89,6 +90,12 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	logger := mir.logger.With(zap.String("site_root", root),
 		zap.String("request_path", urlp))
 	filename := pathInsideRoot(root, urlp)
+	if mir.HideTempFiles {
+		if strings.HasPrefix(path.Base(filename), ".") {
+			logger.Debug("hide temp file", zap.String("filename", filename))
+			return caddyhttp.Error(http.StatusNotFound, errors.New("not found"))
+		}
+	}
 	logger.Debug("creating temp file")
 	incomingFile, err := createTempFile(filename)
 	if err != nil {

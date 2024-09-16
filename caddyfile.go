@@ -93,6 +93,11 @@ func (mir *Mirror) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			default:
 				return d.ArgErr()
 			}
+		case "hide_temp_files":
+			if d.CountRemainingArgs() > 0 {
+				return d.ArgErr()
+			}
+			mir.HideTempFiles = true
 		default:
 			return d.Errf("unknown subdirective '%s'", d.Val())
 		}
