@@ -9,7 +9,7 @@
 &(mirror_upstream) {
 	handle {
 		mirror
-		reverse_proxy https://mirror.example.com:443 {
+		reverse_proxy {$MIRROR_UPSTREAM} {
 			header_up Host {upstream_hostport}
 			header_up -X-Forwarded-*
 			transport http {
@@ -45,11 +45,10 @@
 localhost {
 	root * /srv/mirror
 	@read method GET HEAD OPTIONS
-	# These are files and paths that are dynamically updated in apt (deb) repos, always check upstream first if there is a newer version available
-	@debrepos path */current/* InRelease Release Release.gpg Packages.* Sources.* Contents-* Translation-* Commands-* Index
+	# These are files and paths that are dynamically updated in deb repos, always check upstream first if there is a newer version available
+	@debrepos path */current/* */InRelease */Release */Release.gpg */Packages.* */Sources.* */Contents-* */Translation-* */Commands-* */Index
 	# These are file names that are dynamically updated in yum (RPM) repos
-	@yumrepos path repomd.xml state COMPOSE_ID
-	@file file
+	@yumrepos path */repomd.xml */state */COMPOSE_ID
 	handle @read {
 		route @yumrepos {
 			invoke mirror_upstream
