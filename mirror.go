@@ -67,21 +67,12 @@ func (mir *Mirror) Provision(ctx caddy.Context) error {
 }
 
 func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if r.Method != http.MethodGet {
-		mir.logger.Debug("Pass through non-GET request",
-			zap.String("method", r.Method),
-			zap.String("path", r.URL.Path))
+	if mir.shouldPassThrough(r) {
 		return next.ServeHTTP(w, r)
 	}
 	urlp := r.URL.Path
 	if !path.IsAbs(urlp) {
 		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("URL path %v not absolute", urlp))
-	}
-	if strings.HasSuffix(urlp, "/") {
-		// Pass through directory requests unmodified
-		mir.logger.Debug("skip directory browse",
-			zap.String("request_path", urlp))
-		return next.ServeHTTP(w, r)
 	}
 
 	// Replace any Caddy placeholders in Root
@@ -102,6 +93,22 @@ func (mir *Mirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyh
 	w = rww
 
 	return next.ServeHTTP(w, r)
+}
+
+func (mir *Mirror) shouldPassThrough(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		mir.logger.Debug("Pass through non-GET request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path))
+		return true
+	}
+	if r.URL.Path == "" || strings.HasSuffix(r.URL.Path, "/") {
+		// Pass through directory requests unmodified
+		mir.logger.Debug("skip directory browse",
+			zap.String("request_path", r.URL.Path))
+		return true
+	}
+	return false
 }
 
 var ErrNotRegular = errors.New("file is not a regular file")
